@@ -1,3 +1,8 @@
+This is a clone of FFmpeg with some enhancements on HTTP live streaming
+
+- Each variant belongs to a program. This avoids issue of fetching two separate
+variants for video and audio respectively.
+
 FFmpeg README
 -------------
 
