@@ -45,4 +45,15 @@ void ff_http_init_auth_state(URLContext *dest, const URLContext *src);
  */
 int ff_http_do_new_request(URLContext *h, const char *uri);
 
+/**
+ * Get whether location is changed during the connection.
+ *
+ * @param h URL context for this HTTP connection
+ * @param is_changed 1 indicates location is changed, 0 otherwise.  
+ * h->location contains the latest location
+ */
+void ff_http_get_location_changed(URLContext *h, int *is_changed);
+void ff_http_get_new_location(URLContext *h, char* dst);
+
+
 #endif /* AVFORMAT_HTTP_H */

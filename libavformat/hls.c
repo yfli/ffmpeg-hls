@@ -35,6 +35,7 @@
 #include "internal.h"
 #include "avio_internal.h"
 #include "url.h"
+#include "http.h"
 
 #define INITIAL_BUFFER_SIZE 32768
 
@@ -212,6 +213,8 @@ static int parse_playlist(HLSContext *c, const char *url,
     int close_in = 0;
 
     if (!in) {
+        int is_redirected = 0;
+        URLContext *h = NULL;
         AVDictionary *opts = NULL;
         close_in = 1;
         /* Some HLS servers dont like being sent the range header */
@@ -221,6 +224,13 @@ static int parse_playlist(HLSContext *c, const char *url,
         av_dict_free(&opts);
         if (ret < 0)
             return ret;
+
+        h = (URLContext *) in->opaque;
+        ff_http_get_location_changed(h, &is_redirected);
+        if ( is_redirected ) {
+           ff_http_get_new_location(h, var->url);
+           av_log(NULL, AV_LOG_WARNING, "the var url changed to %s \n", var->url);
+        }
     }
 
     read_chomp_line(in, line, sizeof(line));

@@ -49,6 +49,7 @@ typedef struct {
     char *content_type;
     char *user_agent;
     int64_t off, filesize;
+    int location_changed; /**< Set if redirect has happen. */
     char location[MAX_URL_SIZE];
     HTTPAuthState auth_state;
     HTTPAuthState proxy_auth_state;
@@ -102,6 +103,18 @@ void ff_http_init_auth_state(URLContext *dest, const URLContext *src)
     memcpy(&((HTTPContext*)dest->priv_data)->proxy_auth_state,
            &((HTTPContext*)src->priv_data)->proxy_auth_state,
            sizeof(HTTPAuthState));
+}
+
+void ff_http_get_location_changed(URLContext *h, int *is_changed)
+{
+    HTTPContext *s = h->priv_data;
+    *is_changed = s->location_changed;
+}
+
+void ff_http_get_new_location(URLContext *h, char* dst)
+{
+    HTTPContext *s = h->priv_data;
+    av_strlcpy(dst, s->location, sizeof(s->location));
 }
 
 /* return non zero if error */
@@ -192,6 +205,7 @@ static int http_open_cnx(URLContext *h)
     if ((s->http_code == 301 || s->http_code == 302 || s->http_code == 303 || s->http_code == 307)
         && location_changed == 1) {
         /* url moved, get next */
+        s->location_changed = 1;
         ffurl_closep(&s->hd);
         if (redirects++ >= MAX_REDIRECTS)
             return AVERROR(EIO);
@@ -229,6 +243,7 @@ static int http_open(URLContext *h, const char *uri, int flags)
         h->is_streamed = 1;
 
     s->filesize = -1;
+    s->location_changed = 0;
     av_strlcpy(s->location, uri, sizeof(s->location));
 
     if (s->headers) {
