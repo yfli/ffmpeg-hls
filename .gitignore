@@ -17,6 +17,8 @@
 *-example
 *-test
 *_g
+/cscope.*
+/*.diff
 /.config
 /.version
 /ffmpeg
