@@ -863,6 +863,7 @@ typedef struct AVProgram {
     enum AVDiscard discard;        ///< selects which program to discard and which to feed to the caller
     unsigned int   *stream_index;
     unsigned int   nb_stream_indexes;
+    unsigned int   bitrate;     // to be used by hls variant
     AVDictionary *metadata;
 
     int program_num;

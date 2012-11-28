@@ -566,6 +566,7 @@ static int hls_read_header(AVFormatContext *s)
         if ( !program )
             goto fail;
         av_dict_set(&program->metadata, "variant_bitrate", bitrate_str, 0);
+        program->bitrate = v->bandwidth;
 
         /* Create new AVStreams for each stream in this variant */
         for (j = 0; j < v->ctx->nb_streams; j++) {
@@ -574,7 +575,7 @@ static int hls_read_header(AVFormatContext *s)
                 ret = AVERROR(ENOMEM);
                 goto fail;
             }
-            ff_program_add_stream_index(s, i, stream_offset + j);
+            ff_program_add_stream_index(s, i, st->index);
             st->id = i;
             avcodec_copy_context(st->codec, v->ctx->streams[j]->codec);
             if (v->bandwidth)
