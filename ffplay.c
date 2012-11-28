@@ -275,10 +275,12 @@ typedef struct VideoState {
 
     int is_hls;
     HLSParams hls_params;
-    int current_variant_id;
 
-    int video_frame_number  ;
-    int64_t last_video_fps_calculate_time ;
+    int video_frame_number;
+    int64_t last_video_fps_calculate_time;
+    int fps_up_count;
+    int fps_low_count ;
+    int change_variant; // if 0, do nothing; >0, up;<0, down
     int fps  ;
 
 } VideoState;
@@ -1309,35 +1311,59 @@ static void update_video_pts(VideoState *is, double pts, int64_t pos, int serial
 
 static void update_video_fps(VideoState *is) {
     int64_t time = av_gettime() / 1000000;
-    is->video_frame_number++;
     if (time - is->last_video_fps_calculate_time > 5) { // calc fps every 5 seconds
         is->fps = is->video_frame_number/(time - is->last_video_fps_calculate_time);
         is->last_video_fps_calculate_time = time;
         av_log(NULL, AV_LOG_INFO, "last_calc_time:%"PRId64", cur_time:%"PRId64", video_number:%d \n",
                 is->last_video_fps_calculate_time, time, is->video_frame_number);
         is->video_frame_number = 0;
+
+        //TODO, better logic than hard-coded fps nb
+        if( is->fps > 24 && 
+                is->hls_params.current_variant != is->hls_params.nb_variants-1){
+            is->fps_up_count++;
+            if (is->fps_up_count > 5) {
+                is->change_variant = 1;
+                is->fps_up_count = 0;
+            }
+        } else {
+            is->fps_up_count = 0;
+        }
+
+        if( is->fps < 20 &&
+                is->hls_params.current_variant != 0){
+            is->fps_low_count++;
+            if (is->fps_low_count > 5) {
+                is->change_variant = -1;
+                is->fps_low_count = 0;
+            }
+        } else {
+            is->fps_low_count = 0;
+        }
     }
+
+
 }
 
     
-static void hls_adjust_variant(VideoState *is) {
+static void hls_adjust_variant(VideoState *is) 
+{
+    if (!is->change_variant)
+        return;
 
-    if (is->fps < 23 ) {// downgrade, TODO:better logic
+    if (is->change_variant < 0 ) {// downgrade
         SDL_Event event;
         event.type = FF_HLS_DOWN_EVENT;
         event.user.data1 = is;
         SDL_PushEvent(&event);
-        return;
-    }
-
-    if (is->fps > 28 ) {// upgrade, TODO:better logic
+    } else {// upgrade 
         SDL_Event event;
         event.type = FF_HLS_UP_EVENT;
         event.user.data1 = is;
         SDL_PushEvent(&event);
-        return;
     }
-    
+    is->change_variant = 0;
+    return;
 }
 
 /* called to display each frame */
@@ -1409,6 +1435,7 @@ retry:
                 }
             }
 
+            is->video_frame_number++;
             update_video_fps(is);
 
             if (is->subtitle_st) {
@@ -1474,8 +1501,8 @@ display:
     }
     is->force_refresh = 0;
 
-    //if (is->is_hls)
-     //   hls_adjust_variant(is);
+    if (is->is_hls)
+       hls_adjust_variant(is);
 
     if (show_status) {
         static int64_t last_time;
