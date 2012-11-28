@@ -139,6 +139,20 @@ typedef struct AudioParams {
     enum AVSampleFormat fmt;
 } AudioParams;
 
+
+typedef struct HLSVariant {
+    int bitrate;
+    int program_id;
+} HLSVariant;
+
+//TODO use a fixed variant size for now 
+#define HLS_VARIANT_MAX_SIZE (16)
+typedef struct HLSParams {
+    int nb_variants;
+    int current_variant;
+    HLSVariant variants[HLS_VARIANT_MAX_SIZE];
+} HLSParams;
+
 enum {
     AV_SYNC_AUDIO_MASTER, /* default choice */
     AV_SYNC_VIDEO_MASTER,
@@ -258,6 +272,15 @@ typedef struct VideoState {
     int last_video_stream, last_audio_stream, last_subtitle_stream;
 
     SDL_cond *continue_read_thread;
+
+    int is_hls;
+    HLSParams hls_params;
+    int current_variant_id;
+
+    int video_frame_number  ;
+    int64_t last_video_fps_calculate_time ;
+    int fps  ;
+
 } VideoState;
 
 /* options specified by the user */
@@ -312,9 +335,12 @@ static int64_t audio_callback_time;
 
 static AVPacket flush_pkt;
 
+
 #define FF_ALLOC_EVENT   (SDL_USEREVENT)
 #define FF_REFRESH_EVENT (SDL_USEREVENT + 1)
 #define FF_QUIT_EVENT    (SDL_USEREVENT + 2)
+#define FF_HLS_UP_EVENT   (SDL_USEREVENT + 3)
+#define FF_HLS_DOWN_EVENT (SDL_USEREVENT + 4)
 
 static SDL_Surface *screen;
 
@@ -1074,6 +1100,8 @@ static void video_display(VideoState *is)
 static int refresh_thread(void *opaque)
 {
     VideoState *is= opaque;
+
+
     while (!is->abort_request) {
         SDL_Event event;
         event.type = FF_REFRESH_EVENT;
@@ -1279,12 +1307,46 @@ static void update_video_pts(VideoState *is, double pts, int64_t pos, int serial
         check_external_clock_sync(is, is->video_current_pts);
 }
 
+static void update_video_fps(VideoState *is) {
+    int64_t time = av_gettime() / 1000000;
+    is->video_frame_number++;
+    if (time - is->last_video_fps_calculate_time > 5) { // calc fps every 5 seconds
+        is->fps = is->video_frame_number/(time - is->last_video_fps_calculate_time);
+        is->last_video_fps_calculate_time = time;
+        av_log(NULL, AV_LOG_INFO, "last_calc_time:%"PRId64", cur_time:%"PRId64", video_number:%d \n",
+                is->last_video_fps_calculate_time, time, is->video_frame_number);
+        is->video_frame_number = 0;
+    }
+}
+
+    
+static void hls_adjust_variant(VideoState *is) {
+
+    if (is->fps < 23 ) {// downgrade, TODO:better logic
+        SDL_Event event;
+        event.type = FF_HLS_DOWN_EVENT;
+        event.user.data1 = is;
+        SDL_PushEvent(&event);
+        return;
+    }
+
+    if (is->fps > 28 ) {// upgrade, TODO:better logic
+        SDL_Event event;
+        event.type = FF_HLS_UP_EVENT;
+        event.user.data1 = is;
+        SDL_PushEvent(&event);
+        return;
+    }
+    
+}
+
 /* called to display each frame */
 static void video_refresh(void *opaque)
 {
     VideoState *is = opaque;
     VideoPicture *vp;
     double time;
+
 
     SubPicture *sp, *sp2;
 
@@ -1313,8 +1375,10 @@ retry:
                 goto retry;
             }
 
-            if (is->paused)
+            if (is->paused) {
+                is->last_video_fps_calculate_time = 0;
                 goto display;
+            }
 
             /* compute nominal last_duration */
             last_duration = vp->pts - is->frame_last_pts;
@@ -1344,6 +1408,8 @@ retry:
                     goto retry;
                 }
             }
+
+            update_video_fps(is);
 
             if (is->subtitle_st) {
                 if (is->subtitle_stream_changed) {
@@ -1407,6 +1473,10 @@ display:
             video_display(is);
     }
     is->force_refresh = 0;
+
+    //if (is->is_hls)
+     //   hls_adjust_variant(is);
+
     if (show_status) {
         static int64_t last_time;
         int64_t cur_time;
@@ -1427,7 +1497,7 @@ display:
             av_diff = 0;
             if (is->audio_st && is->video_st)
                 av_diff = get_audio_clock(is) - get_video_clock(is);
-            printf("%7.2f A-V:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB f=%"PRId64"/%"PRId64"   \r",
+            printf("%7.2f A-V:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB f=%"PRId64"/%"PRId64" fps=%4d  \r",
                    get_master_clock(is),
                    av_diff,
                    is->frame_drops_early + is->frame_drops_late,
@@ -1435,7 +1505,8 @@ display:
                    vqsize / 1024,
                    sqsize,
                    is->video_st ? is->video_st->codec->pts_correction_num_faulty_dts : 0,
-                   is->video_st ? is->video_st->codec->pts_correction_num_faulty_pts : 0);
+                   is->video_st ? is->video_st->codec->pts_correction_num_faulty_pts : 0,
+                   is->fps);
             fflush(stdout);
             last_time = cur_time;
         }
@@ -2483,6 +2554,116 @@ static int decode_interrupt_cb(void *ctx)
     return is->abort_request;
 }
 
+static int variant_comp(const void *a, const void *b){
+    return ((HLSVariant *)a)->bitrate - ((HLSVariant *)b)->bitrate; 
+}
+
+static void hls_init_params(VideoState* is, AVFormatContext *s){
+    int nb_variants;
+    if(strncmp(s->iformat->name, "hls", 3)) {
+        is->is_hls = 0;
+        return;
+    }
+
+    is->is_hls = 1;
+    nb_variants = (s->nb_programs<HLS_VARIANT_MAX_SIZE)
+        ?s->nb_programs:HLS_VARIANT_MAX_SIZE;
+    is->hls_params.nb_variants = nb_variants;
+    for(int i = 0; i<nb_variants; i++){
+        AVProgram *program = s->programs[i];
+        is->hls_params.variants[i].bitrate = program->bitrate;
+        is->hls_params.variants[i].program_id = i;
+    }
+
+    qsort(is->hls_params.variants, nb_variants,
+            sizeof(HLSVariant), variant_comp);
+
+    return;
+}
+
+static void hls_init_streams(VideoState* is, int st_index[]) {
+    int program_id;
+    AVProgram * p;
+
+    /* use variant 0 which is minimal bitrate */
+    program_id = is->hls_params.variants[0].program_id;
+    p = is->ic->programs[program_id];
+
+    for (int i = 0; i < p->nb_stream_indexes; i++) {
+        AVStream *st = is->ic->streams[p->stream_index[i]];
+        st_index[st->codec->codec_type] = p->stream_index[i];
+    }
+
+}
+
+static void hls_change_variant(VideoState *is, int new_variant) {
+
+    int i;
+    int new_streams[AVMEDIA_TYPE_NB];
+    AVProgram *p = is->ic->programs[
+        is->hls_params.variants[new_variant].program_id];
+
+    av_log(NULL, AV_LOG_WARNING, "change to variant: %d.\n", new_variant);
+    fprintf(stderr,  "params, v:%d, a:%d, \n", is->video_stream, is->audio_stream);
+    memset(new_streams, -1, sizeof(new_streams));
+
+    //TODO use stream that matches old stream offset in program
+    for (i = 0; i < p->nb_stream_indexes; i++) {
+        AVStream *st = is->ic->streams[p->stream_index[i]];
+
+        /* audio parameters need be OK */
+        if( st->codec->coder_type == AVMEDIA_TYPE_AUDIO &&
+                (st->codec->sample_rate == 0 || 
+                 st->codec->channels == 0)) 
+            continue;
+
+        new_streams[st->codec->codec_type] = p->stream_index[i];
+    }
+
+    fprintf(stderr,  "new params, nv:%d, na:%d, \n", 
+        new_streams[AVMEDIA_TYPE_VIDEO],
+        new_streams[AVMEDIA_TYPE_AUDIO]);
+
+    if (is->video_stream >= 0)
+    {
+        fprintf(stderr,  "close video: %d.\n", is->video_stream);
+        stream_component_close(is, is->video_stream);
+    }
+    if (is->audio_stream >= 0)
+    {
+        fprintf(stderr,  "close audio: %d.\n", is->audio_stream);
+        stream_component_close(is, is->audio_stream);
+    }
+    if (is->subtitle_stream >= 0)
+        stream_component_close(is, is->subtitle_stream);
+
+    if (new_streams[AVMEDIA_TYPE_AUDIO] >= 0) {
+        fprintf(stderr,  "open audio: %d.\n", new_streams[AVMEDIA_TYPE_AUDIO]);
+        stream_component_open(is, new_streams[AVMEDIA_TYPE_AUDIO]);
+    }
+    if (new_streams[AVMEDIA_TYPE_VIDEO] >= 0) {
+        fprintf(stderr,  "open video: %d.\n", new_streams[AVMEDIA_TYPE_VIDEO]);
+        stream_component_open(is, new_streams[AVMEDIA_TYPE_VIDEO]);
+        is->que_attachments_req = 1;
+    }
+    if (new_streams[AVMEDIA_TYPE_SUBTITLE] >= 0) {
+        stream_component_open(is, new_streams[AVMEDIA_TYPE_SUBTITLE]);
+    }
+
+}
+
+static void hls_down_variant(VideoState *is) {
+    if (is->hls_params.current_variant == 0)
+        return;
+    hls_change_variant(is, --is->hls_params.current_variant);
+}
+static void hls_up_variant(VideoState *is) {
+    if (is->hls_params.current_variant == is->hls_params.nb_variants -1)
+        return;
+
+    hls_change_variant(is, ++is->hls_params.current_variant);
+}
+
 static int is_realtime(AVFormatContext *s)
 {
     if(   !strcmp(s->iformat->name, "rtp")
@@ -2573,27 +2754,34 @@ static int read_thread(void *arg)
     }
 
     is->realtime = is_realtime(ic);
+    hls_init_params(is, ic);
 
     for (i = 0; i < ic->nb_streams; i++)
         ic->streams[i]->discard = AVDISCARD_ALL;
-    if (!video_disable)
-        st_index[AVMEDIA_TYPE_VIDEO] =
-            av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO,
-                                wanted_stream[AVMEDIA_TYPE_VIDEO], -1, NULL, 0);
-    if (!audio_disable)
-        st_index[AVMEDIA_TYPE_AUDIO] =
-            av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO,
-                                wanted_stream[AVMEDIA_TYPE_AUDIO],
-                                st_index[AVMEDIA_TYPE_VIDEO],
-                                NULL, 0);
-    if (!video_disable)
-        st_index[AVMEDIA_TYPE_SUBTITLE] =
-            av_find_best_stream(ic, AVMEDIA_TYPE_SUBTITLE,
-                                wanted_stream[AVMEDIA_TYPE_SUBTITLE],
-                                (st_index[AVMEDIA_TYPE_AUDIO] >= 0 ?
-                                 st_index[AVMEDIA_TYPE_AUDIO] :
-                                 st_index[AVMEDIA_TYPE_VIDEO]),
-                                NULL, 0);
+    if (!is->is_hls) {
+        if (!video_disable)
+            st_index[AVMEDIA_TYPE_VIDEO] =
+                av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO,
+                        wanted_stream[AVMEDIA_TYPE_VIDEO], -1, NULL, 0);
+        if (!audio_disable)
+            st_index[AVMEDIA_TYPE_AUDIO] =
+                av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO,
+                        wanted_stream[AVMEDIA_TYPE_AUDIO],
+                        st_index[AVMEDIA_TYPE_VIDEO],
+                        NULL, 0);
+        if (!video_disable)
+            st_index[AVMEDIA_TYPE_SUBTITLE] =
+                av_find_best_stream(ic, AVMEDIA_TYPE_SUBTITLE,
+                        wanted_stream[AVMEDIA_TYPE_SUBTITLE],
+                        (st_index[AVMEDIA_TYPE_AUDIO] >= 0 ?
+                         st_index[AVMEDIA_TYPE_AUDIO] :
+                         st_index[AVMEDIA_TYPE_VIDEO]),
+                        NULL, 0);
+    }
+    else {
+        hls_init_streams(is, st_index);
+    }
+
     if (show_status) {
         av_dump_format(ic, 0, is->filename, 0);
     }
@@ -2805,6 +2993,11 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
     is->audio_current_pts_drift = -av_gettime() / 1000000.0;
     is->video_current_pts_drift = is->audio_current_pts_drift;
     is->av_sync_type = av_sync_type;
+
+    is->last_video_fps_calculate_time = av_gettime()/1000000;
+    is->video_frame_number = 0;
+    is->fps = 0;
+
     is->read_tid     = SDL_CreateThread(read_thread, is);
     if (!is->read_tid) {
         av_free(is);
@@ -2946,6 +3139,12 @@ static void event_loop(VideoState *cur_stream)
             case SDLK_t:
                 stream_cycle_channel(cur_stream, AVMEDIA_TYPE_SUBTITLE);
                 break;
+            case SDLK_d:
+                hls_down_variant(cur_stream);
+                break;
+            case SDLK_u:
+                hls_up_variant(cur_stream);
+                break;
             case SDLK_w:
                 toggle_audio_display(cur_stream);
                 cur_stream->force_refresh = 1;
@@ -3048,6 +3247,12 @@ static void event_loop(VideoState *cur_stream)
         case FF_REFRESH_EVENT:
             video_refresh(event.user.data1);
             cur_stream->refresh = 0;
+            break;
+        case FF_HLS_UP_EVENT:
+            hls_up_variant(event.user.data1);
+            break;
+        case FF_HLS_DOWN_EVENT:
+            hls_down_variant(event.user.data1);
             break;
         default:
             break;
